@@ -1,12 +1,3 @@
-"""
-Wind Turbine Blade Tracking Application
-
-This application uses YOLO segmentation models to track wind turbine blades in real-time
-from webcam feed or process recorded videos. It features advanced tracking algorithms
-including dynamic hub detection, angle-based ID assignment, and prediction for stable
-blade identification through occlusions.
-"""
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -14,256 +5,112 @@ import math
 import argparse
 import time
 import itertools
-from typing import List, Dict, Tuple, Optional, Any
 
-# =============================================================================
-# ANGLE-BASED ID STABILIZATION
-# =============================================================================
+# -------------------- Angle-Stable ID logic --------------------
+def ang_diff(a, b):
+    d = (a - b + math.pi) % (2 * math.pi) - math.pi
+    return d
 
 class AngleIDStabilizer:
-    """
-    Stabilizes blade IDs using angular position prediction and history.
-
-    This class maintains consistent blade identification even when blades
-    temporarily disappear from view by predicting their positions based on
-    angular velocity and matching reappearing blades to predicted locations.
-    """
-
-    def __init__(self, n_blades: int = 3, max_missing: int = 10, alpha: float = 0.7):
-        """
-        Initialize the stabilizer.
-
-        Args:
-            n_blades: Expected number of blades in the turbine
-            max_missing: Maximum frames a blade can be missing before forgetting it
-            alpha: Smoothing factor for angular velocity (0-1, higher = more smoothing)
-        """
+    def __init__(self, n_blades=3, max_missing=10, alpha=0.7):
         self.n_blades = n_blades
+        self.stable_id_map = {}
+        self.stable_id_counter = 1
+        self.last_known_angles = {}
+        self.angular_velocities = {}
+        self.missing_frames = {}
         self.max_missing = max_missing
         self.alpha = alpha
 
-        # Tracking state
-        self.stable_id_counter = 1
-        self.stable_id_map = {}  # tracker_id -> stable_id
-        self.last_known_angles = {}  # stable_id -> last angle
-        self.angular_velocities = {}  # stable_id -> angular velocity
-        self.missing_frames = {}  # stable_id -> frames missing
-
-    def get_stable_ids(self, detections_with_ids: List[Dict], hub_cx: float, hub_cy: float, fps: Optional[float] = None) -> Dict[int, int]:
-        """
-        Assign stable IDs to detections based on angular position and prediction.
-
-        Args:
-            detections_with_ids: List of detection dicts with 'id' and 'centroid' keys
-            hub_cx, hub_cy: Current hub position coordinates
-            fps: Frames per second (optional, for future use)
-
-        Returns:
-            Dictionary mapping tracker IDs to stable blade IDs
-        """
-        # Extract current angles for all detected blades
+    def get_stable_ids(self, detections_with_ids, hub_cx, hub_cy, fps=None):
         current_tracker_ids = set()
         current_angles = {}
-
-        for detection in detections_with_ids:
-            tracker_id = detection['id']
-            centroid_x, centroid_y = detection['centroid']
+        for d in detections_with_ids:
+            tracker_id, (det_cx, det_cy) = d['id'], d['centroid']
             current_tracker_ids.add(tracker_id)
-            current_angles[tracker_id] = math.atan2(centroid_y - hub_cy, centroid_x - hub_cx)
+            current_angles[tracker_id] = math.atan2(det_cy - hub_cy, det_cx - hub_cx)
 
-        # Predict positions for missing blades
-        predicted_angles = self._predict_missing_blade_angles()
-
-        # Match current detections to predicted positions
-        assignments = self._match_detections_to_predictions(
-            current_tracker_ids, current_angles, predicted_angles
-        )
-
-        # Assign new IDs to unmatched detections
-        assignments = self._assign_new_ids_to_unmatched(
-            current_tracker_ids, current_angles, assignments
-        )
-
-        return assignments
-
-    def _predict_missing_blade_angles(self) -> Dict[int, float]:
-        """Predict angular positions for blades that are currently missing."""
+        new_assignments = {}
         predicted_angles = {}
-
         for stable_id, last_angle in self.last_known_angles.items():
             if self.missing_frames[stable_id] < self.max_missing:
-                # Predict new angle based on angular velocity
-                predicted_angle = last_angle + self.angular_velocities.get(stable_id, 0)
-                # Normalize to [-π, π]
-                predicted_angle = (predicted_angle + math.pi) % (2 * math.pi) - math.pi
-                predicted_angles[stable_id] = predicted_angle
+                pred_angle = last_angle + self.angular_velocities.get(stable_id, 0)
+                pred_angle = (pred_angle + math.pi) % (2 * math.pi) - math.pi
+                predicted_angles[stable_id] = pred_angle
                 self.missing_frames[stable_id] += 1
             else:
-                # Blade has been missing too long, keep last known position
                 predicted_angles[stable_id] = last_angle
 
-        return predicted_angles
-
-    def _match_detections_to_predictions(self, current_tracker_ids: set, current_angles: Dict[int, float],
-                                       predicted_angles: Dict[int, float]) -> Dict[int, int]:
-        """Match current detections to predicted blade positions."""
-        assignments = {}
         unassigned_tracker_ids = list(current_tracker_ids)
         assigned_stable_ids = set()
 
-        # Greedily assign best matches
         while unassigned_tracker_ids and len(assigned_stable_ids) < self.n_blades:
             best_match = None
-            min_angular_diff = float('inf')
+            min_diff = float('inf')
 
-            for stable_id, predicted_angle in predicted_angles.items():
+            for stable_id, pred_angle in predicted_angles.items():
                 if stable_id in assigned_stable_ids:
                     continue
 
                 for tracker_id in unassigned_tracker_ids:
-                    current_angle = current_angles[tracker_id]
-                    angular_diff = abs(ang_diff(current_angle, predicted_angle))
-
-                    if angular_diff < min_angular_diff:
-                        min_angular_diff = angular_diff
+                    curr_angle = current_angles[tracker_id]
+                    diff = abs(ang_diff(curr_angle, pred_angle))
+                    if diff < min_diff:
+                        min_diff = diff
                         best_match = (tracker_id, stable_id)
 
             if best_match:
                 tracker_id, stable_id = best_match
-                assignments[tracker_id] = stable_id
-
-                # Update tracking state
-                self._update_blade_state(stable_id, current_angles[tracker_id])
-
+                new_assignments[tracker_id] = stable_id
+                self.angular_velocities[stable_id] = self.alpha * ang_diff(current_angles[tracker_id], self.last_known_angles.get(stable_id, current_angles[tracker_id])) + (1 - self.alpha) * self.angular_velocities.get(stable_id, 0)
+                self.last_known_angles[stable_id] = current_angles[tracker_id]
+                self.missing_frames[stable_id] = 0
                 unassigned_tracker_ids.remove(tracker_id)
                 assigned_stable_ids.add(stable_id)
-
-                # Remove from predictions once assigned
                 if stable_id in predicted_angles:
                     del predicted_angles[stable_id]
             else:
                 break
 
-        return assignments
+        for tracker_id in unassigned_tracker_ids:
+            if self.stable_id_counter <= self.n_blades:
+                new_assignments[tracker_id] = self.stable_id_counter
+                self.last_known_angles[self.stable_id_counter] = current_angles[tracker_id]
+                self.angular_velocities[self.stable_id_counter] = 0
+                self.missing_frames[self.stable_id_counter] = 0
+                self.stable_id_counter += 1
+            else:
+                new_assignments[tracker_id] = -1
 
-    def _assign_new_ids_to_unmatched(self, current_tracker_ids: set, current_angles: Dict[int, float],
-                                    assignments: Dict[int, int]) -> Dict[int, int]:
-        """Assign new stable IDs to detections that couldn't be matched to predictions."""
-        for tracker_id in current_tracker_ids:
-            if tracker_id not in assignments:
-                if self.stable_id_counter <= self.n_blades:
-                    stable_id = self.stable_id_counter
-                    assignments[tracker_id] = stable_id
-                    self._initialize_blade_state(stable_id, current_angles[tracker_id])
-                    self.stable_id_counter += 1
-                else:
-                    # Too many blades detected, mark as invalid
-                    assignments[tracker_id] = -1
+        return new_assignments
 
-        return assignments
-
-    def _update_blade_state(self, stable_id: int, current_angle: float):
-        """Update the state of a matched blade."""
-        # Update angular velocity with exponential smoothing
-        last_angle = self.last_known_angles.get(stable_id, current_angle)
-        angle_change = ang_diff(current_angle, last_angle)
-        current_velocity = self.angular_velocities.get(stable_id, 0)
-
-        self.angular_velocities[stable_id] = (self.alpha * angle_change +
-                                            (1 - self.alpha) * current_velocity)
-        self.last_known_angles[stable_id] = current_angle
-        self.missing_frames[stable_id] = 0
-
-    def _initialize_blade_state(self, stable_id: int, initial_angle: float):
-        """Initialize state for a newly detected blade."""
-        self.last_known_angles[stable_id] = initial_angle
-        self.angular_velocities[stable_id] = 0
-        self.missing_frames[stable_id] = 0
-
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
-def ang_diff(a: float, b: float) -> float:
-    """
-    Calculate the smallest angular difference between two angles in radians.
-
-    Args:
-        a: First angle in radians
-        b: Second angle in radians
-
-    Returns:
-        Angular difference normalized to [-π, π]
-    """
-    d = (a - b + math.pi) % (2 * math.pi) - math.pi
-    return d
-
-
-def mask_centroid(mask_poly_xy: np.ndarray) -> Optional[Tuple[float, float]]:
-    """
-    Calculate the centroid of a polygon using the shoelace formula.
-
-    Args:
-        mask_poly_xy: Nx2 array of polygon vertices
-
-    Returns:
-        (cx, cy) centroid coordinates, or None if calculation fails
-    """
+# -------------------- Helpers --------------------
+def mask_centroid(mask_poly_xy):
     if mask_poly_xy is None or len(mask_poly_xy) == 0:
         return None
-
     x = mask_poly_xy[:, 0]
     y = mask_poly_xy[:, 1]
     a = np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))
-
     if abs(a) < 1e-6:
-        # Degenerate polygon, return mean
         return float(np.mean(x)), float(np.mean(y))
-
-    # Use shoelace formula for centroid
     cx = np.sum((x + np.roll(x, -1)) * (x * np.roll(y, -1) - y * np.roll(x, -1))) / (3 * a)
     cy = np.sum((y + np.roll(y, -1)) * (x * np.roll(y, -1) - y * np.roll(x, -1))) / (3 * a)
     return float(cx), float(cy)
 
-
-def fit_line_to_mask(mask_poly_xy: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Fit a line to a polygon mask using OpenCV's fitLine function.
-
-    Args:
-        mask_poly_xy: Nx2 array of polygon vertices
-
-    Returns:
-        (direction_vector, point_on_line) or None if fitting fails
-    """
+def fit_line_to_mask(mask_poly_xy):
     if mask_poly_xy is None or len(mask_poly_xy) < 2:
         return None
-
     points = mask_poly_xy.astype(np.float32)
     [vx, vy, x0, y0] = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
     return np.array([vx[0], vy[0]]), np.array([x0[0], y0[0]])
 
-
-def compute_intersection(line1_dir: np.ndarray, line1_pt: np.ndarray,
-                        line2_dir: np.ndarray, line2_pt: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Compute intersection point of two lines.
-
-    Args:
-        line1_dir: Direction vector of first line
-        line1_pt: Point on first line
-        line2_dir: Direction vector of second line
-        line2_pt: Point on second line
-
-    Returns:
-        Intersection point or None if lines are parallel
-    """
+def compute_intersection(line1_dir, line1_pt, line2_dir, line2_pt):
     A = np.array([line1_dir, -line2_dir]).T
     b = line2_pt - line1_pt
     try:
         ts = np.linalg.solve(A, b)
         return line1_pt + ts[0] * line1_dir
-    except np.linalg.LinAlgError:
+    except:
         return None
 
 # Parse arguments
