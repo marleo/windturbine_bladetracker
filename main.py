@@ -118,6 +118,7 @@ parser = argparse.ArgumentParser(description='Wind Turbine Blade Tracking')
 parser.add_argument('--headless', action='store_true', help='Run without UI')
 parser.add_argument('--video', type=str, help='Path to input video file (optional)')
 parser.add_argument('--output', type=str, help='Path to output video file (required when using --video)')
+parser.add_argument('--debug', action='store_true', help='Show performance metrics overlay')
 args = parser.parse_args()
 
 # Validate arguments
@@ -127,7 +128,7 @@ if args.headless and args.video:
     parser.error("--headless cannot be used with --video")
 
 # Load the YOLO model
-model = YOLO('yolov11n_full_2609.pt')  # Assuming the model file is in the same directory
+model = YOLO('yolov11s.pt')  # Assuming the model file is in the same directory
 
 # Configuration
 N_BLADES = 3
@@ -200,6 +201,8 @@ while True:
     inference_time = time.time() - inference_start
     fps = 1.0 / inference_time if inference_time > 0 else 0
 
+    # Process detections
+    processing_start = time.time()
     detections_with_ids = []
     r0 = results[0]
     if r0.boxes and r0.boxes.id is not None:
@@ -220,8 +223,10 @@ while True:
                     'centroid': ((x1+x2)/2, (y1+y2)/2),
                     'poly': None
                 })
+    processing_time = time.time() - processing_start
 
     # Hub estimation using line intersections
+    hub_estimation_start = time.time()
     mask_lines = []
     for d in detections_with_ids:
         if d['poly'] is not None:
@@ -242,12 +247,17 @@ while True:
             new_hub = np.mean(intersections, axis=0)
             smoothed_hub_pos = (HUB_SMOOTHING_ALPHA * new_hub + 
                               (1 - HUB_SMOOTHING_ALPHA) * smoothed_hub_pos)
+    hub_estimation_time = time.time() - hub_estimation_start
 
     hub_cx, hub_cy = smoothed_hub_pos
 
+    # ID stabilization (angle prediction)
+    id_stabilization_start = time.time()
     stable_id_map = stabilizer.get_stable_ids(detections_with_ids, hub_cx, hub_cy)
+    id_stabilization_time = time.time() - id_stabilization_start
 
     # Draw results
+    rendering_start = time.time()
     annotated_frame = frame.copy()
     for d in detections_with_ids:
         stable_id = stable_id_map.get(d['id'])
@@ -267,9 +277,24 @@ while True:
     cv2.circle(annotated_frame, (int(hub_cx), int(hub_cy)), 5, (255,255,255), -1)
     cv2.circle(annotated_frame, (int(hub_cx), int(hub_cy)), 9, (0,0,0), 2)
 
-    # Display FPS
-    cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30), 
-                FONT, FONT_SCALE, (0, 255, 0), THICKNESS, cv2.LINE_AA)
+    # Display performance metrics (only in debug mode)
+    if args.debug:
+        cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30), 
+                    FONT, FONT_SCALE, (0, 255, 0), THICKNESS, cv2.LINE_AA)
+        cv2.putText(annotated_frame, f"Inference: {inference_time*1000:.1f}ms", (10, 60), 
+                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+        cv2.putText(annotated_frame, f"Processing: {processing_time*1000:.1f}ms", (10, 90), 
+                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+        cv2.putText(annotated_frame, f"Hub Est: {hub_estimation_time*1000:.1f}ms", (10, 120), 
+                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+        cv2.putText(annotated_frame, f"ID Stab: {id_stabilization_time*1000:.1f}ms", (10, 150), 
+                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+        
+        rendering_time = time.time() - rendering_start
+        cv2.putText(annotated_frame, f"Rendering: {rendering_time*1000:.1f}ms", (10, 180), 
+                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+    else:
+        rendering_time = time.time() - rendering_start
 
     if args.video:
         # Write frame to output video
