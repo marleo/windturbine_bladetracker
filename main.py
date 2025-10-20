@@ -5,6 +5,14 @@ import math
 import argparse
 import time
 import itertools
+parser = argparse.ArgumentParser(description='Wind Turbine Blade Tracking')
+parser.add_argument('--headless', action='store_true', help='Run without UI')
+parser.add_argument('--video', type=str, help='Path to input video file (optional)')
+parser.add_argument('--output', type=str, help='Path to output video file (required when using --video)')
+parser.add_argument('--debug', action='store_true', help='Show performance metrics overlay')
+parser.add_argument('--model', type=str, default='yolov11s.pt', help='Path to YOLO model file (default: yolov11s.pt)')
+parser.add_argument('--norender', action='store_true', help='Skip video rendering and output average performance metrics to console')
+args = parser.parse_args()
 
 # -------------------- Angle-Stable ID logic --------------------
 def ang_diff(a, b):
@@ -113,22 +121,67 @@ def compute_intersection(line1_dir, line1_pt, line2_dir, line2_pt):
     except:
         return None
 
-# Parse arguments
-parser = argparse.ArgumentParser(description='Wind Turbine Blade Tracking')
-parser.add_argument('--headless', action='store_true', help='Run without UI')
-parser.add_argument('--video', type=str, help='Path to input video file (optional)')
-parser.add_argument('--output', type=str, help='Path to output video file (required when using --video)')
-parser.add_argument('--debug', action='store_true', help='Show performance metrics overlay')
-args = parser.parse_args()
-
 # Validate arguments
-if args.video and not args.output:
-    parser.error("--output is required when using --video")
+if args.video and not args.output and not args.norender:
+    parser.error("--output is required when using --video (unless --norender is specified)")
 if args.headless and args.video:
     parser.error("--headless cannot be used with --video")
 
 # Load the YOLO model
-model = YOLO('yolov11s.pt')  # Assuming the model file is in the same directory
+model = YOLO(args.model, task='segment')
+
+# Print device information and GPU diagnostics
+print(f"Loading model: {args.model}")
+try:
+    device_info = str(model.device)
+    print(f"Model device: {device_info}")
+    
+    # Check if model has CUDA parameters (more reliable than device attribute)
+    has_cuda_params = False
+    try:
+        for param in model.parameters():
+            if param.is_cuda:
+                has_cuda_params = True
+                break
+    except:
+        pass
+    
+    if has_cuda_params or 'cuda' in device_info.lower():
+        print(f"Inference device: GPU ({device_info})")
+    else:
+        print(f"Inference device: CPU ({device_info})")
+        print("Checking for GPU availability...")
+        
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+            print(f"PyTorch CUDA available: {cuda_available}")
+            if cuda_available:
+                device_count = torch.cuda.device_count()
+                print(f"CUDA devices: {device_count}")
+                for i in range(device_count):
+                    print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+                print("Note: Model may still use GPU for inference even if device shows CPU")
+            else:
+                print("No CUDA support detected")
+        except ImportError:
+            print("PyTorch not available")
+            
+except AttributeError:
+    print("Model device attribute not available. Checking PyTorch status...")
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+        print(f"PyTorch CUDA available: {cuda_available}")
+        if cuda_available:
+            device_count = torch.cuda.device_count()
+            print(f"CUDA devices: {device_count}")
+            for i in range(device_count):
+                print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+        else:
+            print("No CUDA support detected")
+    except ImportError:
+        print("PyTorch not available")
 
 # Configuration
 N_BLADES = 3
@@ -154,15 +207,17 @@ if args.video:
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Setup video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(args.output, fourcc, fps, (W, H))
+    # Setup video writer (only if not norender mode)
+    if not args.norender:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(args.output, fourcc, fps, (W, H))
     print(f"Processing video: {args.video}")
-    print(f"Output: {args.output}")
+    if not args.norender:
+        print(f"Output: {args.output}")
     print(f"Resolution: {W}x{H}, FPS: {fps}, Frames: {total_frames}")
 else:
     # Webcam setup
-    cap = cv2.VideoCapture(1)  # 0 for default webcam
+    cap = cv2.VideoCapture(2)  # 0 for default webcam
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     if not cap.isOpened():
@@ -173,6 +228,17 @@ else:
 # Initialize stabilizer and hub position
 stabilizer = AngleIDStabilizer(n_blades=N_BLADES)
 smoothed_hub_pos = np.array([W/2, H/2])
+
+# Initialize performance tracking for --norender mode
+if args.norender:
+    perf_times = {
+        'inference': [],
+        'processing': [],
+        'hub_estimation': [],
+        'id_stabilization': [],
+        'rendering': [],
+        'total_fps': []
+    }
 
 # Main loop
 frame_count = 0
@@ -201,6 +267,55 @@ while True:
     inference_time = time.time() - inference_start
     fps = 1.0 / inference_time if inference_time > 0 else 0
 
+    # Collect performance data for --norender mode
+    if args.norender:
+        perf_times['inference'].append(inference_time)
+        perf_times['total_fps'].append(fps)
+
+    # Check actual inference device from results (most accurate)
+    if frame_count == 1:  # Only check on first frame
+        try:
+            r0 = results[0]
+            actual_device = None
+            
+            # Try multiple ways to get device info from results
+            if hasattr(r0, 'boxes') and r0.boxes is not None:
+                if hasattr(r0.boxes, 'device'):
+                    actual_device = str(r0.boxes.device)
+                elif hasattr(r0.boxes, 'xyxy') and hasattr(r0.boxes.xyxy, 'device'):
+                    actual_device = str(r0.boxes.xyxy.device)
+                    
+            # Check masks if available
+            if actual_device is None and hasattr(r0, 'masks') and r0.masks is not None:
+                if hasattr(r0.masks, 'device'):
+                    actual_device = str(r0.masks.device)
+                elif hasattr(r0.masks, 'xy') and len(r0.masks.xy) > 0:
+                    # Check the actual tensor device
+                    try:
+                        import torch
+                        if isinstance(r0.masks.xy[0], torch.Tensor):
+                            actual_device = str(r0.masks.xy[0].device)
+                    except:
+                        pass
+            
+            if actual_device:
+                if 'cuda' in actual_device.lower():
+                    print(f"✓ Actual inference device: GPU ({actual_device})")
+                else:
+                    print(f"✓ Actual inference device: CPU ({actual_device})")
+            else:
+                # Fallback: estimate based on performance
+                if fps > 30:  # Rough heuristic: >30 FPS suggests GPU for 640x640 YOLO inference
+                    print("Could not determine actual inference device from results")
+                    print("✓ Estimated: GPU (based on high FPS performance)")
+                else:
+                    print("Could not determine actual inference device from results")
+                    print("⚠ Estimated: CPU (based on low FPS performance)")
+                
+        except Exception as e:
+            print(f"Could not check inference device: {e}")
+            print("Note: High FPS suggests GPU usage despite device reporting issues")
+
     # Process detections
     processing_start = time.time()
     detections_with_ids = []
@@ -224,6 +339,10 @@ while True:
                     'poly': None
                 })
     processing_time = time.time() - processing_start
+
+    # Collect performance data for --norender mode
+    if args.norender:
+        perf_times['processing'].append(processing_time)
 
     # Hub estimation using line intersections
     hub_estimation_start = time.time()
@@ -249,6 +368,10 @@ while True:
                               (1 - HUB_SMOOTHING_ALPHA) * smoothed_hub_pos)
     hub_estimation_time = time.time() - hub_estimation_start
 
+    # Collect performance data for --norender mode
+    if args.norender:
+        perf_times['hub_estimation'].append(hub_estimation_time)
+
     hub_cx, hub_cy = smoothed_hub_pos
 
     # ID stabilization (angle prediction)
@@ -256,59 +379,100 @@ while True:
     stable_id_map = stabilizer.get_stable_ids(detections_with_ids, hub_cx, hub_cy)
     id_stabilization_time = time.time() - id_stabilization_start
 
-    # Draw results
+    # Collect performance data for --norender mode
+    if args.norender:
+        perf_times['id_stabilization'].append(id_stabilization_time)
+
+    # Draw results (only if not norender mode)
     rendering_start = time.time()
-    annotated_frame = frame.copy()
-    for d in detections_with_ids:
-        stable_id = stable_id_map.get(d['id'])
-        if stable_id and stable_id > 0:
-            px, py = d['centroid']
-            color = BLADE_COLORS[(stable_id - 1) % len(BLADE_COLORS)]
-            if d['poly'] is not None:
-                overlay = annotated_frame.copy()
-                cv2.fillPoly(overlay, [d['poly']], color)
-                cv2.addWeighted(overlay, 0.4, annotated_frame, 0.6, 0, annotated_frame)
-            cv2.putText(annotated_frame, f"Blade {stable_id}", (int(px)+6,int(py)-6),
-                        FONT, FONT_SCALE, (0,0,0), THICKNESS+2, cv2.LINE_AA)
-            cv2.putText(annotated_frame, f"Blade {stable_id}", (int(px)+6,int(py)-6),
-                        FONT, FONT_SCALE, color, THICKNESS, cv2.LINE_AA)
-            cv2.circle(annotated_frame, (int(px), int(py)), 4, color, -1)
+    if not args.norender:
+        annotated_frame = frame.copy()
+        for d in detections_with_ids:
+            stable_id = stable_id_map.get(d['id'])
+            if stable_id and stable_id > 0:
+                px, py = d['centroid']
+                color = BLADE_COLORS[(stable_id - 1) % len(BLADE_COLORS)]
+                if d['poly'] is not None:
+                    overlay = annotated_frame.copy()
+                    cv2.fillPoly(overlay, [d['poly']], color)
+                    cv2.addWeighted(overlay, 0.4, annotated_frame, 0.6, 0, annotated_frame)
+                cv2.putText(annotated_frame, f"Blade {stable_id}", (int(px)+6,int(py)-6),
+                            FONT, FONT_SCALE, (0,0,0), THICKNESS+2, cv2.LINE_AA)
+                cv2.putText(annotated_frame, f"Blade {stable_id}", (int(px)+6,int(py)-6),
+                            FONT, FONT_SCALE, color, THICKNESS, cv2.LINE_AA)
+                cv2.circle(annotated_frame, (int(px), int(py)), 4, color, -1)
 
-    cv2.circle(annotated_frame, (int(hub_cx), int(hub_cy)), 5, (255,255,255), -1)
-    cv2.circle(annotated_frame, (int(hub_cx), int(hub_cy)), 9, (0,0,0), 2)
+        cv2.circle(annotated_frame, (int(hub_cx), int(hub_cy)), 5, (255,255,255), -1)
+        cv2.circle(annotated_frame, (int(hub_cx), int(hub_cy)), 9, (0,0,0), 2)
 
-    # Display performance metrics (only in debug mode)
-    if args.debug:
-        cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30), 
-                    FONT, FONT_SCALE, (0, 255, 0), THICKNESS, cv2.LINE_AA)
-        cv2.putText(annotated_frame, f"Inference: {inference_time*1000:.1f}ms", (10, 60), 
-                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
-        cv2.putText(annotated_frame, f"Processing: {processing_time*1000:.1f}ms", (10, 90), 
-                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
-        cv2.putText(annotated_frame, f"Hub Est: {hub_estimation_time*1000:.1f}ms", (10, 120), 
-                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
-        cv2.putText(annotated_frame, f"ID Stab: {id_stabilization_time*1000:.1f}ms", (10, 150), 
-                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
-        
-        rendering_time = time.time() - rendering_start
-        cv2.putText(annotated_frame, f"Rendering: {rendering_time*1000:.1f}ms", (10, 180), 
-                    FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+        # Display performance metrics (only in debug mode)
+        if args.debug:
+            cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30), 
+                        FONT, FONT_SCALE, (0, 255, 0), THICKNESS, cv2.LINE_AA)
+            cv2.putText(annotated_frame, f"Inference: {inference_time*1000:.1f}ms", (10, 60), 
+                        FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+            cv2.putText(annotated_frame, f"Processing: {processing_time*1000:.1f}ms", (10, 90), 
+                        FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+            cv2.putText(annotated_frame, f"Hub Est: {hub_estimation_time*1000:.1f}ms", (10, 120), 
+                        FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+            cv2.putText(annotated_frame, f"ID Stab: {id_stabilization_time*1000:.1f}ms", (10, 150), 
+                        FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+            
+            rendering_time = time.time() - rendering_start
+            cv2.putText(annotated_frame, f"Rendering: {rendering_time*1000:.1f}ms", (10, 180), 
+                        FONT, FONT_SCALE, (255, 255, 0), THICKNESS, cv2.LINE_AA)
+        else:
+            rendering_time = time.time() - rendering_start
     else:
-        rendering_time = time.time() - rendering_start
+        rendering_time = 0  # No rendering in norender mode
 
-    if args.video:
+    # Collect performance data for --norender mode
+    if args.norender:
+        perf_times['rendering'].append(rendering_time)
+
+    if args.video and not args.norender:
         # Write frame to output video
         out.write(annotated_frame)
         print(f"\rProcessing frame {frame_count}/{total_frames} (FPS: {fps:.1f})", end="", flush=True)
-    elif not args.headless:
+    elif not args.headless and not args.norender:
         cv2.imshow('Blade Tracking', annotated_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+    elif args.norender:
+        # Progress indicator for norender mode
+        if frame_count % 10 == 0 or frame_count == total_frames:  # Update every 10 frames
+            print(f"\rProcessing frame {frame_count}/{total_frames}", end="", flush=True)
     else:
         time.sleep(0.033)  # ~30 fps in headless mode
 
 cap.release()
-if args.video:
+if args.video and not args.norender:
     out.release()
     print(f"\nVideo processing completed. Output saved to: {args.output}")
 cv2.destroyAllWindows()
+
+# Output performance summary for --norender mode
+if args.norender:
+    print(f"\n\nPerformance Summary ({frame_count} frames processed):")
+    print("=" * 50)
+    
+    # Calculate averages
+    avg_inference = sum(perf_times['inference']) / len(perf_times['inference']) * 1000
+    avg_processing = sum(perf_times['processing']) / len(perf_times['processing']) * 1000
+    avg_hub_est = sum(perf_times['hub_estimation']) / len(perf_times['hub_estimation']) * 1000
+    avg_id_stab = sum(perf_times['id_stabilization']) / len(perf_times['id_stabilization']) * 1000
+    avg_rendering = sum(perf_times['rendering']) / len(perf_times['rendering']) * 1000 if sum(perf_times['rendering']) > 0 else 0
+    avg_fps = sum(perf_times['total_fps']) / len(perf_times['total_fps'])
+    
+    print(f"Average Inference Time:  {avg_inference:.2f} ms")
+    print(f"Average Processing Time: {avg_processing:.2f} ms")
+    print(f"Average Hub Estimation:  {avg_hub_est:.2f} ms")
+    print(f"Average ID Stabilization: {avg_id_stab:.2f} ms")
+    if avg_rendering > 0:
+        print(f"Average Rendering Time:  {avg_rendering:.2f} ms")
+    else:
+        print(f"Average Rendering Time:  0.00 ms (skipped in --norender mode)")
+    print(f"Average FPS:            {avg_fps:.1f}")
+    
+    total_avg_time = avg_inference + avg_processing + avg_hub_est + avg_id_stab + (avg_rendering if avg_rendering > 0 else 0)
+    print(f"Total Average Time:      {total_avg_time:.2f} ms")
