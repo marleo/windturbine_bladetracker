@@ -11,6 +11,8 @@ from ultralytics import YOLO
 import math
 import argparse
 import time
+import threading
+import queue
 import itertools
 from typing import List, Tuple, Dict, Optional, Any
 from dataclasses import dataclass
@@ -388,7 +390,7 @@ class VideoProcessor:
 
         else:
             # Webcam input
-            self.capture = cv2.VideoCapture(1)  # Use camera index 2
+            self.capture = cv2.VideoCapture(2)  # Use camera index 2
             self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -467,7 +469,7 @@ class BladeTracker:
         """Initialize the YOLO model and print device information."""
         try:
             print(f"Loading model: {self.model_path}")
-            self.model = YOLO(self.model_path, task='segment').to('cuda')
+            self.model = YOLO(self.model_path, task='segment')
 
             # Print device information
             device_info = str(self.model.device)
@@ -700,50 +702,152 @@ class BladeTracker:
 
     def run(self, video_processor: VideoProcessor):
         """Main processing loop."""
-        print("Starting blade tracking...")
+        print("Starting blade tracking (non-blocking pipeline)...")
 
-        while True:
-            frame = video_processor.read_frame()
-            if frame is None:
-                break
+        # Bounded queues to keep latency low and avoid unbounded memory use.
+        frame_queue: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(maxsize=3)
+        result_queue: "queue.Queue[Optional[Tuple[np.ndarray, PerformanceMetrics, Dict[int,int]]]]" = queue.Queue(maxsize=3)
+        stop_event = threading.Event()
 
-            self.frame_count += 1
+        def inference_worker():
+            """Worker that consumes frames, runs inference & postprocessing, and pushes results to result_queue."""
+            while not stop_event.is_set():
+                try:
+                    item = frame_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
 
-            # Process frame
-            annotated_frame, metrics, stable_ids = self.process_frame(frame)
-
-            # Handle output
-            if video_processor.video_path and not self.no_render:
-                video_processor.write_frame(annotated_frame)
-                print(f"\rProcessing frame {self.frame_count}/{video_processor.total_frames} (FPS: {metrics.fps:.1f})", end="", flush=True)
-
-            elif not self.headless and not self.no_render:
-                cv2.imshow('Wind Turbine Blade Tracking', annotated_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if item is None:
+                    # Sentinel received -> shutdown
                     break
 
-            elif self.no_render:
-                # Check if we are processing a video file
-                if video_processor.video_path:
-                    if self.frame_count % 10 == 0 or self.frame_count == video_processor.total_frames:
-                        print(f"\rProcessing frame {self.frame_count}/{video_processor.total_frames}", end="", flush=True)
-                # Or if we are in webcam mode
-                else:
-                    # Get unique, valid, sorted stable IDs
-                    tracked_blades = sorted(list(set(id for id in stable_ids.values() if id > 0)))
-                    tracked_blades_str = ", ".join(map(str, tracked_blades))
-                    
-                    # Print full live stats with timings (in ms)
-                    print(f"\rFPS: {metrics.fps:<5.1f} | "
-                          f"Blades: [{tracked_blades_str:<7}] | "
-                          f"Infer: {metrics.inference_time*1000:<5.1f}ms | "
-                          f"Proc: {metrics.processing_time*1000:<5.1f}ms | "
-                          f"Hub: {metrics.hub_estimation_time*1000:<5.1f}ms | "
-                          f"ID: {metrics.id_stabilization_time*1000:<5.1f}ms   ",
-                          end="", flush=True)
+                frame, seq = item
 
-            else:
-                time.sleep(0.033)  # ~30 FPS
+                # Run full processing for the frame (inference + postprocessing)
+                try:
+                    annotated_frame, metrics, stable_ids = self.process_frame(frame)
+                    # Put results for rendering/writing
+                    try:
+                        result_queue.put_nowait((annotated_frame, metrics, stable_ids, seq))
+                    except queue.Full:
+                        # Drop oldest result to make room (keep latest)
+                        try:
+                            _ = result_queue.get_nowait()
+                            result_queue.put_nowait((annotated_frame, metrics, stable_ids, seq))
+                        except queue.Empty:
+                            pass
+                except Exception as e:
+                    print(f"Inference worker error: {e}")
+
+            # Ensure renderer can stop
+            try:
+                result_queue.put_nowait(None)
+            except Exception:
+                pass
+
+        def renderer_worker():
+            """Worker that consumes processed frames and handles display / file writing / metrics printing."""
+            last_seq = -1
+            while not stop_event.is_set():
+                try:
+                    item = result_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                if item is None:
+                    break
+
+                annotated_frame, metrics, stable_ids, seq = item
+
+                # If frames arrive out of order drop older ones (keep last)
+                if seq <= last_seq:
+                    continue
+                last_seq = seq
+
+                # Handle output (display or write)
+                if video_processor.video_path and not self.no_render:
+                    video_processor.write_frame(annotated_frame)
+                    print(f"\rProcessing frame {seq}/{video_processor.total_frames} (FPS: {metrics.fps:.1f})", end="", flush=True)
+
+                elif not self.headless and not self.no_render:
+                    cv2.imshow('Wind Turbine Blade Tracking', annotated_frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        stop_event.set()
+                        break
+
+                elif self.no_render:
+                    if video_processor.video_path:
+                        if seq % 10 == 0 or seq == video_processor.total_frames:
+                            print(f"\rProcessing frame {seq}/{video_processor.total_frames}", end="", flush=True)
+                    else:
+                        tracked_blades = sorted(list(set(id for id in stable_ids.values() if id > 0)))
+                        tracked_blades_str = ", ".join(map(str, tracked_blades))
+                        print(f"\rFPS: {metrics.fps:<5.1f} | "
+                              f"Blades: [{tracked_blades_str:<7}] | "
+                              f"Infer: {metrics.inference_time*1000:<5.1f}ms | "
+                              f"Proc: {metrics.processing_time*1000:<5.1f}ms | "
+                              f"Hub: {metrics.hub_estimation_time*1000:<5.1f}ms | "
+                              f"ID: {metrics.id_stabilization_time*1000:<5.1f}ms   ",
+                              end="", flush=True)
+
+                else:
+                    time.sleep(0.001)
+
+            # Renderer exiting
+            return
+
+        # Start workers
+        infer_thread = threading.Thread(target=inference_worker, name="inference_worker", daemon=True)
+        render_thread = threading.Thread(target=renderer_worker, name="renderer_worker", daemon=True)
+        infer_thread.start()
+        render_thread.start()
+
+        seq = 0
+        try:
+            while True:
+                frame = video_processor.read_frame()
+                if frame is None:
+                    # Signal shutdown to inference
+                    try:
+                        frame_queue.put_nowait(None)
+                    except Exception:
+                        pass
+                    break
+
+                self.frame_count += 1
+                seq += 1
+
+                # Try to push frame into queue without blocking. If full, drop the oldest frame to keep latency low.
+                try:
+                    frame_queue.put_nowait((frame, seq))
+                except queue.Full:
+                    try:
+                        _ = frame_queue.get_nowait()  # drop oldest
+                        frame_queue.put_nowait((frame, seq))
+                    except Exception:
+                        pass
+
+                # Small sleep to yield CPU (capture loop stays responsive)
+                time.sleep(0.001)
+
+                # Check for user-requested stop (window close)
+                if stop_event.is_set():
+                    break
+
+        finally:
+            # Request shutdown
+            stop_event.set()
+            try:
+                frame_queue.put_nowait(None)
+            except Exception:
+                pass
+            try:
+                result_queue.put_nowait(None)
+            except Exception:
+                pass
+
+            infer_thread.join(timeout=2.0)
+            render_thread.join(timeout=2.0)
 
         # Print performance summary for no-render mode
         if self.no_render:
